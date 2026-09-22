@@ -197,6 +197,29 @@ bool sim_addrs_up(int n) {
     return (true);
 }
 
+// ensure_gossip_key creates the shared gossip
+// key once per cluster. Reuses it when present.
+static bool ensure_gossip_key(void) {
+    struct stat st;
+
+    if (mkdir("/tmp/resonance", 0700) != 0 &&
+        errno != EEXIST) {
+        return (false);
+    }
+    if (stat("/tmp/resonance/gossip.key",
+             &st) == 0 &&
+        st.st_size == 32) {
+        return (true);
+    }
+    if (!run("head -c 32 /dev/urandom > "
+             "/tmp/resonance/gossip.key && "
+             "chmod 600 "
+             "/tmp/resonance/gossip.key")) {
+        return (false);
+    }
+    return (true);
+}
+
 // spawn_one seeds node i and forks it. Stores pid and
 // logfd. Parent config root must exist. clock_offset is
 // the CONCORD_CLOCK_OFFSET value for this node, or NULL
@@ -235,6 +258,27 @@ static bool spawn_one(pid_t* pid, int* logfd, int i,
              "cp certs/ca.key %s/ 2>/dev/null", certs);
     if (!run(cmd))
         return false;
+
+    // Seed shared gossip key into
+    // $XDG_CONFIG_HOME/concord/memberservice.
+    // Concord requires identical secret.key
+    // on every node.
+    if (!ensure_gossip_key())
+        return (false);
+    snprintf(cmd, sizeof(cmd),
+             "mkdir -p %s/concord/memberservice",
+             dir);
+    if (!run(cmd))
+        return (false);
+    snprintf(cmd, sizeof(cmd),
+             "cp /tmp/resonance/gossip.key "
+             "%s/concord/memberservice/"
+             "secret.key && chmod 600 "
+             "%s/concord/memberservice/"
+             "secret.key",
+             dir, dir);
+    if (!run(cmd))
+        return (false);
 
     snprintf(
         cmd, sizeof(cmd),
