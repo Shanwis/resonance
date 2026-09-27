@@ -101,31 +101,78 @@ static int read_assignment(int node, const char* wid,
     return (1);
 }
 
-// count_assignees reports how many distinct non-nil
-// SegmentIDs were ever recorded for wid cluster-wide.
-static int count_assignees(const char* wid) {
+// node_id stores node i's own id from its config.
+// Returns 1 on success.
+static int node_id(int i, char* out, size_t n) {
     FILE* fp;
-    char cmd[512];
-    char buf[64];
-    int k;
+    char cmd[256];
+    char buf[128];
+    char id[64];
 
     snprintf(cmd, sizeof(cmd),
-             "grep -h '%s' /tmp/resonance/node*/concord/"
-             "journal.jsonl 2>/dev/null | grep -o "
-             "'\"SegmentID\":\"[^\"]*\"' | grep -v '%s' | "
-             "sort -u | wc -l",
-             wid, NIL_UUID);
+             "grep -o '\"id\":\"[^\"]*\"' "
+             "/tmp/resonance/node%d/concord/"
+             "config.json 2>/dev/null",
+             i);
     fp = popen(cmd, "r");
     if (fp == NULL)
-        return (-1);
+        return (0);
     if (fgets(buf, sizeof(buf), fp) == NULL) {
         pclose(fp);
-        return (-1);
+        return (0);
     }
     pclose(fp);
-    if (sscanf(buf, "%d", &k) != 1)
-        return (-1);
-    return (k);
+    if (sscanf(buf, "\"id\":\"%63[^\"]\"", id) != 1)
+        return (0);
+    if (strlen(id) + 1 > n)
+        return (0);
+    strcpy(out, id);
+    return (1);
+}
+
+// author_assigned reports 1 if node i's journal holds
+// a non-nil SegmentID for wid authored by node i
+// itself: this side acted independently. Synced
+// copies keep their author, so reunion cannot fake
+// this. The spec payload carries no node_id field,
+// so the match is the outer author only.
+static int author_assigned(int node, const char* wid) {
+    char cmd[768];
+    char pat[128];
+    char self[64];
+    int rc;
+
+    if (!node_id(node, self, sizeof(self)))
+        return (0);
+    snprintf(pat, sizeof(pat), "\"node_id\":\"%s\"",
+             self);
+    snprintf(cmd, sizeof(cmd),
+             "grep '%s' /tmp/resonance/node%d/concord/"
+             "journal.jsonl 2>/dev/null | grep "
+             "'\"SegmentID\":\"' | grep -v '%s' | "
+             "grep -q '%s'",
+             wid, node, NIL_UUID, pat);
+    rc = system(cmd);
+    return (rc == 0);
+}
+
+// sides_authored reports 1 when the victim journal
+// and at least one pair journal each hold a self-
+// authored non-nil SegmentID for wid: both sides
+// acted, whatever they picked.
+static int sides_authored(int victim,
+                           const char* wid) {
+    int i;
+
+    if (!author_assigned(victim, wid))
+        return (0);
+    for (i = 0; i < N; i++) {
+        if (i == victim)
+            continue;
+        if (author_assigned(i, wid))
+            return (1);
+    }
+    return (0);
 }
 
 // assigned_anywhere reports 1 if any journal holds a
@@ -295,7 +342,8 @@ int main(void) {
     int has[N];
     char wid[64], shortid[16];
     char segs[N][64];
-    int i, victim, phase, seen3, alive, tries, duel;
+    int i, victim, phase, seen3, alive, tries;
+    int authored;
     time_t t0, tcheck, start;
 
     if (access("./bin/concord", X_OK) != 0) {
@@ -332,7 +380,6 @@ int main(void) {
     phase = 0;
     seen3 = 0;
     tries = 0;
-    duel = -1;
     t0 = 0;
     tcheck = 0;
     wid[0] = '\0';
@@ -442,7 +489,7 @@ int main(void) {
             break;
     }
 
-    duel = count_assignees(wid);
+    authored = sides_authored(victim, wid);
     for (i = 0; i < N; i++) {
         kill(pids[i], SIGTERM);
         waitpid(pids[i], NULL, 0);
@@ -451,17 +498,25 @@ int main(void) {
     }
     context_free(&ctx);
     sim_netns_teardown(N);
+    if (phase != 3 || !authored) {
+        fprintf(stderr,
+                "concord_duel: fail phase=%d authored=%d "
+                "%s=%s/%s/%s\n",
+                phase, authored, shortid, segs[0],
+                segs[1], segs[2]);
+        // Dump journals before cleanup: post-mortem
+        // authorship evidence.
+        if (system("cat "
+                   "/tmp/resonance/node*/concord/"
+                   "journal.jsonl 2>/dev/null") != 0) {
+            // Best effort debug dump.
+        }
+    }
     if (system("rm -rf /tmp/resonance") != 0) {
         // Best effort cleanup, teardown already ran.
     }
 
-    if (phase != 3 || duel < 2) {
-        fprintf(stderr,
-                "concord_duel: fail phase=%d duel=%d "
-                "%s=%s/%s/%s\n",
-                phase, duel, shortid, segs[0], segs[1],
-                segs[2]);
+    if (phase != 3 || !authored)
         return (1);
-    }
     return (0);
 }
