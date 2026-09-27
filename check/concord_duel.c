@@ -145,6 +145,38 @@ static int assigned_anywhere(const char* wid) {
     return (rc == 0);
 }
 
+// spec_present reports 1 if any journal event for
+// wid exists in node i's journal.
+static int spec_present(int node, const char* wid) {
+    char cmd[512];
+    int rc;
+
+    snprintf(cmd, sizeof(cmd),
+             "grep -q '%s' /tmp/resonance/node%d/concord/"
+             "journal.jsonl 2>/dev/null",
+             wid, node);
+    rc = system(cmd);
+    return (rc == 0);
+}
+
+// spec_both_sides reports 1 when the victim journal
+// and at least one pair journal each hold wid: both
+// sides can assign after the cut.
+static int spec_both_sides(int victim,
+                            const char* wid) {
+    int i;
+
+    if (!spec_present(victim, wid))
+        return (0);
+    for (i = 0; i < N; i++) {
+        if (i == victim)
+            continue;
+        if (spec_present(i, wid))
+            return (1);
+    }
+    return (0);
+}
+
 // sides_assigned reports 1 when the victim journal
 // and at least one pair journal each hold a non-nil
 // SegmentID for wid: both sides visibly assigned.
@@ -296,7 +328,7 @@ int main(void) {
         segs[i][0] = '\0';
     }
 
-    victim = 2;
+    victim = elect_victim();
     phase = 0;
     seen3 = 0;
     tries = 0;
@@ -339,17 +371,17 @@ int main(void) {
                 break;
             }
         } else if (phase == 1) {
-            // Split only while the spec is present
-            // everywhere and still unassigned. If the
-            // scheduler got there first, resubmit fresh
-            // and try again.
+            // Split the moment the spec is journaled
+            // on both sides of the cut and nothing is
+            // assigned yet. Waiting for everywhere via
+            // the 2s list poll gives the scheduler a
+            // full extra round: it assigns first and
+            // every try is lost. If the scheduler got
+            // there first, resubmit fresh and try
+            // again.
             ask_lists(has, shortid, &tcheck);
-            if (has[0] && has[1] && has[2]) {
-                if (!assigned_anywhere(wid)) {
-                    victim = elect_victim();
-                    phase = 2;
-                    t0 = 0;
-                } else if (tries >= MAX_TRIES) {
+            if (assigned_anywhere(wid)) {
+                if (tries >= MAX_TRIES) {
                     break;
                 } else if (submit_workload(0, wid,
                                            sizeof(wid))) {
@@ -362,6 +394,9 @@ int main(void) {
                 } else {
                     break;
                 }
+            } else if (spec_both_sides(victim, wid)) {
+                phase = 2;
+                t0 = 0;
             }
         } else if (phase == 2 &&
                    (tcheck == 0 ||
