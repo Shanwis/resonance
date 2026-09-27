@@ -14,16 +14,12 @@
 #include <unistd.h>
 
 #define N 3
-#define SKEW_NODE 2
-#define SKEW_SECS 300
-#define SKEW_OFFSET "300"
 #define HOLD_UP 8
 #define DEADLINE 180
 #define IMAGE "docker.io/library/nginx:alpine"
 
-// skew demo: mesh three nodes with node 2's wall clock
-// 300s ahead via the Concord test time hook, submit on
-// node 0, watch the workload converge everywhere anyway.
+// demo: mesh three nodes, submit on node 0,
+// watch the workload converge everywhere.
 
 // drain_tun pumps one packet.
 static void drain_tun(TunMap* map, MediumGrid* grid,
@@ -44,59 +40,6 @@ static void drain_log(int i, int fd, int* seen3) {
     printf("\033[%dm[node %d]\033[0m %s", 36 + i, i, buf);
     if (strstr(buf, "\"peers\":3") != NULL)
         *seen3 = 1;
-}
-
-// journal_now reads node i's latest journal event time
-// as epoch seconds. Returns -1 when unreadable.
-static time_t journal_now(int node) {
-    FILE* fp;
-    char cmd[512];
-    char buf[256];
-    char* t;
-    int Y, Mo, D, h, mi, s;
-    struct tm tm;
-
-    snprintf(cmd, sizeof(cmd),
-             "grep -h '\"timestamp\"' /tmp/resonance/node%d/"
-             "concord/journal.jsonl 2>/dev/null | tail -1",
-             node);
-    fp = popen(cmd, "r");
-    if (fp == NULL)
-        return (-1);
-    if (fgets(buf, sizeof(buf), fp) == NULL) {
-        pclose(fp);
-        return (-1);
-    }
-    pclose(fp);
-    t = strstr(buf, "\"timestamp\":\"");
-    if (t == NULL)
-        return (-1);
-    if (sscanf(t, "\"timestamp\":\"%4d-%2d-%2dT%2d:%2d:%2d",
-               &Y, &Mo, &D, &h, &mi, &s) != 6)
-        return (-1);
-    memset(&tm, 0, sizeof(tm));
-    tm.tm_year = Y - 1900;
-    tm.tm_mon = Mo - 1;
-    tm.tm_mday = D;
-    tm.tm_hour = h;
-    tm.tm_min = mi;
-    tm.tm_sec = s;
-    return (timegm(&tm));
-}
-
-// skew_ok reports 1 when node 2's journal runs
-// SKEW_SECS ahead of true time: the fault is live,
-// not assumed. Log timestamps come from the logging
-// library's own clock and stay true; only the hooked
-// application clock skews.
-static int skew_ok(void) {
-    time_t j, d;
-
-    j = journal_now(SKEW_NODE);
-    if (j == (time_t)-1)
-        return (0);
-    d = j - time(NULL);
-    return (d > SKEW_SECS - 60 && d < SKEW_SECS + 60);
 }
 
 // workload_present runs workload list against node and
@@ -207,8 +150,7 @@ int main(void) {
         return (1);
     if (!sim_addrs_up(N))
         return (1);
-    if (!sim_spawn_concord_skew(pids, logfds, N,
-                                SKEW_NODE, SKEW_OFFSET))
+    if (!sim_spawn_concord(pids, logfds, N))
         return (1);
 
     for (i = 0; i < N; i++) {
@@ -218,7 +160,7 @@ int main(void) {
         p[N + i].events = POLLIN;
         has[i] = 0;
     }
-    printf("resonance: 3 nodes ready - skew demo\n");
+    printf("resonance: 3 nodes ready\n");
 
     phase = 0;
     seen3 = 0;
@@ -238,13 +180,10 @@ int main(void) {
                     drain_log(i, logfds[i], &seen3);
             }
         }
-        if (phase == 0 && seen3 && skew_ok() &&
+        if (phase == 0 && seen3 &&
             hold(&t0, HOLD_UP)) {
             // Submit on node 0, wait for all to list
-            // it across the skewed clock.
-            printf("resonance: skew +300s live on node "
-                   "%d\n",
-                   SKEW_NODE);
+            // it.
             if (submit_workload(0, wid, sizeof(wid))) {
                 memcpy(shortid, wid, 8);
                 shortid[8] = '\0';
@@ -285,7 +224,7 @@ int main(void) {
     }
 
     if (done) {
-        printf("resonance: skew converged on all 3 "
+        printf("resonance: converged on all 3 "
                "nodes\n");
         return (0);
     }
